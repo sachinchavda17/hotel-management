@@ -106,6 +106,7 @@ function App() {
             <Route path="/login" element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
             <Route path="/property/:id" element={<PropertyDetailsPage />} />
+            <Route path="/payment/success" element={<PaymentSuccessPage />} />
             <Route
               path="/dashboard"
               element={
