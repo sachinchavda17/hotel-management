@@ -212,14 +212,21 @@ async def get_admin_user(current_user: dict = Depends(get_current_user)) -> dict
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 
-async def send_email(to_email: str, subject: str, body: str):
-    """Real SMTP email sending"""
+async def send_email(to_email: str, subject: str, body: str, is_html: bool = False):
+    """Real SMTP email sending with HTML support"""
     try:
         message = EmailMessage()
         message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
         message["To"] = to_email
         message["Subject"] = subject
-        message.set_content(body)
+        
+        if is_html:
+            message.add_alternative(body, subtype='html')
+        else:
+            message.set_content(body)
+        
+        # Determine if we should use TLS or STARTTLS based on port
+        use_tls = SMTP_PORT == 465
         
         await aiosmtplib.send(
             message,
@@ -227,20 +234,80 @@ async def send_email(to_email: str, subject: str, body: str):
             port=SMTP_PORT,
             username=SMTP_USER,
             password=SMTP_PASSWORD,
-            start_tls=False
+            use_tls=use_tls,
+            start_tls=not use_tls and SMTP_PORT != 2525 # Mailtrap doesn't always like STARTTLS on 2525
         )
         logger.info(f"Email sent successfully to {to_email}")
     except Exception as e:
         logger.error(f"Failed to send email to {to_email}: {str(e)}")
-        # Don't raise exception - email failure shouldn't break the flow
-        # But log it for debugging
+        # Log the content for debugging in dev environment
         logger.info(f"""
-        ========= EMAIL SENT (TEST MODE) =========
+        ========= EMAIL CONTENT (FAILED OR TEST) =========
         To: {to_email}
         Subject: {subject}
-        Body: {body}
-        =========================================
+        HTML: {is_html}
+        Body: {body[:200]}...
+        ==================================================
         """)
+
+def get_welcome_email_html(name: str):
+    return f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+                <h2 style="color: #2563eb;">Welcome to Hotel Booking System!</h2>
+                <p>Hi {name},</p>
+                <p>Welcome to our platform! Your account has been created successfully.</p>
+                <p>You can now browse and book amazing properties worldwide at the best prices.</p>
+                <div style="margin: 30px 0;">
+                    <a href="#" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Start Browsing</a>
+                </div>
+                <p>Best regards,<br>The Hotel Booking Team</p>
+            </div>
+        </body>
+    </html>
+    """
+
+def get_booking_confirmation_html(name: str, property_name: str, check_in: str, check_out: str, total_price: float):
+    return f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+                <h2 style="color: #16a34a;">Booking Confirmed!</h2>
+                <p>Hi {name},</p>
+                <p>Your payment was successful and your booking is now confirmed.</p>
+                <div style="background-color: #f9fafb; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                    <h3 style="margin-top: 0;">Booking Details:</h3>
+                    <p><strong>Property:</strong> {property_name}</p>
+                    <p><strong>Check-in:</strong> {check_in}</p>
+                    <p><strong>Check-out:</strong> {check_out}</p>
+                    <p style="font-size: 18px; font-weight: bold; color: #2563eb;">Total Paid: ${total_price:.2f}</p>
+                </div>
+                <p>We hope you have a wonderful stay!</p>
+                <p>Best regards,<br>The Hotel Booking Team</p>
+            </div>
+        </body>
+    </html>
+    """
+
+def get_cancellation_email_html(name: str, property_name: str, booking_id: str):
+    return f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+                <h2 style="color: #dc2626;">Booking Cancelled</h2>
+                <p>Hi {name},</p>
+                <p>As requested, your booking has been cancelled.</p>
+                <div style="background-color: #fef2f2; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                    <p><strong>Booking ID:</strong> {booking_id}</p>
+                    <p><strong>Property:</strong> {property_name}</p>
+                </div>
+                <p>If you didn't request this or have any questions, please contact our support team immediately.</p>
+                <p>Best regards,<br>The Hotel Booking Team</p>
+            </div>
+        </body>
+    </html>
+    """
 
 # ============= AUTH ROUTES =============
 
@@ -268,7 +335,8 @@ async def register(user_data: UserRegister):
     await send_email(
         user.email,
         "Welcome to Hotel Booking System!",
-        f"Hi {user.name},\n\nWelcome to our Hotel Booking System! Your account has been created successfully.\n\nYou can now browse and book amazing properties worldwide.\n\nBest regards,\nHotel Booking Team"
+        get_welcome_email_html(user.name),
+        is_html=True
     )
     
     return UserResponse(**user.model_dump())
@@ -539,17 +607,8 @@ async def cancel_booking(
     await send_email(
         current_user["email"],
         "Booking Cancelled",
-        f"""Hi {current_user['name']},
-
-Your booking has been cancelled.
-
-Booking ID: {booking_id}
-Property: {booking['property_name']}
-
-If you have any questions, please contact us.
-
-Best regards,
-Hotel Booking Team"""
+        get_cancellation_email_html(current_user['name'], booking['property_name'], booking_id),
+        is_html=True
     )
     
     return {"message": "Booking cancelled successfully"}
@@ -710,20 +769,14 @@ async def get_checkout_status(
                     await send_email(
                         user["email"],
                         "Booking Confirmed - Payment Successful",
-                        f"""Hi {user['name']},
-
-Your payment has been processed successfully and your booking is confirmed!
-
-Booking Details:
-- Property: {booking['property_name']}
-- Check-in: {check_in.strftime('%Y-%m-%d')}
-- Check-out: {check_out.strftime('%Y-%m-%d')}
-- Total Price: ${booking['total_price']:.2f}
-
-Thank you for booking with us!
-
-Best regards,
-Hotel Booking Team"""
+                        get_booking_confirmation_html(
+                            user['name'], 
+                            booking['property_name'], 
+                            check_in.strftime('%Y-%m-%d'), 
+                            check_out.strftime('%Y-%m-%d'), 
+                            booking['total_price']
+                        ),
+                        is_html=True
                     )
         
         return {
@@ -776,6 +829,22 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
+
+# ============= ADMIN TOOLS =============
+
+@api_router.get("/admin/test-email")
+async def test_email_endpoint(current_user: dict = Depends(get_admin_user)):
+    """Test SMTP configuration"""
+    try:
+        await send_email(
+            current_user["email"],
+            "SMTP Configuration Test",
+            f"<h1>Test Successful!</h1><p>Hi {current_user['name']}, your SMTP settings are working correctly.</p>",
+            is_html=True
+        )
+        return {"message": "Test email sent successfully to your email address"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send test email: {str(e)}")
 
 # ============= REVIEW ROUTES =============
 
