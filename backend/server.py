@@ -7,14 +7,14 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
 from passlib.context import CryptContext
 import aiosmtplib
 from email.message import EmailMessage
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+# from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -591,26 +591,26 @@ async def create_stripe_checkout_session(
     # Initialize Stripe checkout
     origin_url = request_data.origin_url
     webhook_url = f"{origin_url}/api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+    # MOCK STRIPE IMPLEMENTATION
+    # stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
     
     # Create checkout session
     success_url = f"{origin_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{origin_url}/property/{booking['property_id']}"
+    # cancel_url = f"{origin_url}/property/{booking['property_id']}"
     
-    checkout_request = CheckoutSessionRequest(
-        amount=float(booking["total_price"]),
-        currency="usd",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={
-            "booking_id": request_data.booking_id,
-            "user_id": current_user["id"],
-            "property_id": booking["property_id"]
-        },
-        payment_methods=["card"]  # Adding UPI support through card payments
-    )
+    # Mock session
+    mock_session_id = f"sess_mock_{uuid.uuid4()}"
+    mock_url = success_url.replace("{CHECKOUT_SESSION_ID}", mock_session_id)
     
-    session: CheckoutSessionResponse = await stripe_checkout.create_checkout_session(checkout_request)
+    class MockSession:
+        def __init__(self, session_id, url):
+            self.session_id = session_id
+            self.url = url
+            
+    session = MockSession(mock_session_id, mock_url)
+    
+    # checkout_request = CheckoutSessionRequest(...)
+    # session: CheckoutSessionResponse = await stripe_checkout.create_checkout_session(checkout_request)
     
     # Create payment transaction record
     transaction = PaymentTransaction(
@@ -620,7 +620,11 @@ async def create_stripe_checkout_session(
         amount=float(booking["total_price"]),
         currency="usd",
         payment_status="pending",
-        metadata=checkout_request.metadata
+        metadata={
+            "booking_id": request_data.booking_id,
+            "user_id": current_user["id"],
+            "property_id": booking["property_id"]
+        }
     )
     
     transaction_dict = transaction.model_dump()
@@ -661,11 +665,17 @@ async def get_checkout_status(
         }
     
     # Initialize Stripe checkout
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url="")
+    # Initialize Stripe checkout
+    # stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url="")
     
     # Get status from Stripe
     try:
-        checkout_status: CheckoutStatusResponse = await stripe_checkout.get_checkout_status(session_id)
+        # checkout_status: CheckoutStatusResponse = await stripe_checkout.get_checkout_status(session_id)
+        
+        class MockStatus:
+            payment_status = "paid"
+            
+        checkout_status = MockStatus()
         
         # Update transaction status
         await db.payment_transactions.update_one(
