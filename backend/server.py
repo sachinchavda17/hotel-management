@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -7,13 +7,14 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
 from passlib.context import CryptContext
 import aiosmtplib
 from email.message import EmailMessage
+# from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -27,6 +28,17 @@ db = client[os.environ['DB_NAME']]
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+
+# SMTP Configuration
+SMTP_HOST = os.environ.get("SMTP_HOST", "sandbox.smtp.mailtrap.io")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 2525))
+SMTP_USER = os.environ.get("SMTP_USER", "test_user")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "test_password")
+SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", "noreply@hotelbooking.com")
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Hotel Booking System")
+
+# Stripe Configuration
+STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "sk_test_emergent")
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -90,6 +102,7 @@ class Property(BaseModel):
     owner_id: str
     rating: float = 0.0
     review_count: int = 0
+    max_guests: int = 2
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class PropertyCreate(BaseModel):
@@ -99,6 +112,7 @@ class PropertyCreate(BaseModel):
     price_per_night: float
     amenities: List[str] = []
     images: List[str] = []
+    max_guests: int = 2
 
 class PropertyUpdate(BaseModel):
     name: Optional[str] = None
@@ -107,6 +121,7 @@ class PropertyUpdate(BaseModel):
     price_per_night: Optional[float] = None
     amenities: Optional[List[str]] = None
     images: Optional[List[str]] = None
+    max_guests: Optional[int] = None
 
 class Booking(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -117,7 +132,9 @@ class Booking(BaseModel):
     check_in: datetime
     check_out: datetime
     total_price: float
-    status: str = "confirmed"  # confirmed, cancelled
+    status: str = "pending"  # pending, confirmed, cancelled
+    payment_status: str = "pending"  # pending, paid, failed
+    stripe_session_id: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class BookingCreate(BaseModel):
@@ -140,10 +157,22 @@ class ReviewCreate(BaseModel):
     rating: int = Field(ge=1, le=5)
     comment: str
 
-class PaymentMock(BaseModel):
+class PaymentTransaction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     booking_id: str
+    user_id: str
+    session_id: str
     amount: float
-    card_number: str
+    currency: str
+    payment_status: str  # pending, paid, failed, expired
+    metadata: Dict[str, str] = {}
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class StripeCheckoutRequest(BaseModel):
+    booking_id: str
+    origin_url: str
 
 # ============= UTILITY FUNCTIONS =============
 
@@ -183,16 +212,102 @@ async def get_admin_user(current_user: dict = Depends(get_current_user)) -> dict
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 
-async def send_email(to_email: str, subject: str, body: str):
-    """Mock email sending - logs to console"""
-    logger.info(f"""
-    ========= EMAIL NOTIFICATION =========
-    To: {to_email}
-    Subject: {subject}
-    Body: {body}
-    =====================================
-    """)
-    # In production, implement real SMTP email sending here
+async def send_email(to_email: str, subject: str, body: str, is_html: bool = False):
+    """Real SMTP email sending with HTML support"""
+    try:
+        message = EmailMessage()
+        message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+        message["To"] = to_email
+        message["Subject"] = subject
+        
+        if is_html:
+            message.add_alternative(body, subtype='html')
+        else:
+            message.set_content(body)
+        
+        # Determine if we should use TLS or STARTTLS based on port
+        use_tls = SMTP_PORT == 465
+        
+        await aiosmtplib.send(
+            message,
+            hostname=SMTP_HOST,
+            port=SMTP_PORT,
+            username=SMTP_USER,
+            password=SMTP_PASSWORD,
+            use_tls=use_tls,
+            start_tls=not use_tls and SMTP_PORT != 2525 # Mailtrap doesn't always like STARTTLS on 2525
+        )
+        logger.info(f"Email sent successfully to {to_email}")
+    except Exception as e:
+        logger.error(f"Failed to send email to {to_email}: {str(e)}")
+        # Log the content for debugging in dev environment
+        logger.info(f"""
+        ========= EMAIL CONTENT (FAILED OR TEST) =========
+        To: {to_email}
+        Subject: {subject}
+        HTML: {is_html}
+        Body: {body[:200]}...
+        ==================================================
+        """)
+
+def get_welcome_email_html(name: str):
+    return f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+                <h2 style="color: #2563eb;">Welcome to Hotel Booking System!</h2>
+                <p>Hi {name},</p>
+                <p>Welcome to our platform! Your account has been created successfully.</p>
+                <p>You can now browse and book amazing properties worldwide at the best prices.</p>
+                <div style="margin: 30px 0;">
+                    <a href="#" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Start Browsing</a>
+                </div>
+                <p>Best regards,<br>The Hotel Booking Team</p>
+            </div>
+        </body>
+    </html>
+    """
+
+def get_booking_confirmation_html(name: str, property_name: str, check_in: str, check_out: str, total_price: float):
+    return f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+                <h2 style="color: #16a34a;">Booking Confirmed!</h2>
+                <p>Hi {name},</p>
+                <p>Your payment was successful and your booking is now confirmed.</p>
+                <div style="background-color: #f9fafb; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                    <h3 style="margin-top: 0;">Booking Details:</h3>
+                    <p><strong>Property:</strong> {property_name}</p>
+                    <p><strong>Check-in:</strong> {check_in}</p>
+                    <p><strong>Check-out:</strong> {check_out}</p>
+                    <p style="font-size: 18px; font-weight: bold; color: #2563eb;">Total Paid: ${total_price:.2f}</p>
+                </div>
+                <p>We hope you have a wonderful stay!</p>
+                <p>Best regards,<br>The Hotel Booking Team</p>
+            </div>
+        </body>
+    </html>
+    """
+
+def get_cancellation_email_html(name: str, property_name: str, booking_id: str):
+    return f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+                <h2 style="color: #dc2626;">Booking Cancelled</h2>
+                <p>Hi {name},</p>
+                <p>As requested, your booking has been cancelled.</p>
+                <div style="background-color: #fef2f2; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                    <p><strong>Booking ID:</strong> {booking_id}</p>
+                    <p><strong>Property:</strong> {property_name}</p>
+                </div>
+                <p>If you didn't request this or have any questions, please contact our support team immediately.</p>
+                <p>Best regards,<br>The Hotel Booking Team</p>
+            </div>
+        </body>
+    </html>
+    """
 
 # ============= AUTH ROUTES =============
 
@@ -220,7 +335,8 @@ async def register(user_data: UserRegister):
     await send_email(
         user.email,
         "Welcome to Hotel Booking System!",
-        f"Hi {user.name}, your account has been created successfully!"
+        get_welcome_email_html(user.name),
+        is_html=True
     )
     
     return UserResponse(**user.model_dump())
@@ -244,17 +360,27 @@ async def login(login_data: UserLogin):
 async def get_me(current_user: dict = Depends(get_current_user)):
     return UserResponse(**current_user)
 
-# ============= PROPERTY ROUTES =============
+# ============= PROPERTY ROUTES WITH ADVANCED FILTERS =============
 
 @api_router.get("/properties", response_model=List[Property])
 async def get_properties(
     location: Optional[str] = None,
     min_price: Optional[float] = None,
-    max_price: Optional[float] = None
+    max_price: Optional[float] = None,
+    amenities: Optional[str] = None,  # Comma-separated amenities
+    min_rating: Optional[float] = None,
+    guests: Optional[int] = None,
+    check_in: Optional[str] = None,
+    check_out: Optional[str] = None,
+    sort_by: Optional[str] = "created_at",  # price_asc, price_desc, rating, created_at
 ):
     query = {}
+    
+    # Location filter
     if location:
         query["location"] = {"$regex": location, "$options": "i"}
+    
+    # Price filter
     if min_price is not None or max_price is not None:
         query["price_per_night"] = {}
         if min_price is not None:
@@ -262,7 +388,57 @@ async def get_properties(
         if max_price is not None:
             query["price_per_night"]["$lte"] = max_price
     
-    properties = await db.properties.find(query, {"_id": 0}).to_list(100)
+    # Amenities filter
+    if amenities:
+        amenity_list = [a.strip() for a in amenities.split(",")]
+        query["amenities"] = {"$all": amenity_list}
+    
+    # Rating filter
+    if min_rating is not None:
+        query["rating"] = {"$gte": min_rating}
+    
+    # Guests filter
+    if guests is not None:
+        query["max_guests"] = {"$gte": guests}
+    
+    # Date availability filter
+    available_property_ids = None
+    if check_in and check_out:
+        try:
+            check_in_dt = datetime.fromisoformat(check_in.replace('Z', '+00:00'))
+            check_out_dt = datetime.fromisoformat(check_out.replace('Z', '+00:00'))
+            
+            # Find all bookings that overlap with requested dates
+            overlapping_bookings = await db.bookings.find({
+                "status": "confirmed",
+                "$or": [
+                    {"check_in": {"$lt": check_out_dt.isoformat()}, "check_out": {"$gt": check_in_dt.isoformat()}}
+                ]
+            }, {"property_id": 1}).to_list(1000)
+            
+            booked_property_ids = [b["property_id"] for b in overlapping_bookings]
+            
+            # Exclude booked properties
+            if booked_property_ids:
+                query["id"] = {"$nin": booked_property_ids}
+        except Exception as e:
+            logger.error(f"Error filtering by dates: {str(e)}")
+    
+    # Determine sort order
+    sort_field = "created_at"
+    sort_direction = -1  # descending by default
+    
+    if sort_by == "price_asc":
+        sort_field = "price_per_night"
+        sort_direction = 1
+    elif sort_by == "price_desc":
+        sort_field = "price_per_night"
+        sort_direction = -1
+    elif sort_by == "rating":
+        sort_field = "rating"
+        sort_direction = -1
+    
+    properties = await db.properties.find(query, {"_id": 0}).sort(sort_field, sort_direction).to_list(100)
     
     for prop in properties:
         if isinstance(prop.get('created_at'), str):
@@ -369,14 +545,16 @@ async def create_booking(
     if overlapping:
         raise HTTPException(status_code=400, detail="Property not available for selected dates")
     
-    # Create booking
+    # Create booking with pending status
     booking = Booking(
         user_id=current_user["id"],
         property_id=booking_data.property_id,
         property_name=prop["name"],
         check_in=check_in,
         check_out=check_out,
-        total_price=total_price
+        total_price=total_price,
+        status="pending",
+        payment_status="pending"
     )
     
     booking_dict = booking.model_dump()
@@ -385,22 +563,6 @@ async def create_booking(
     booking_dict['created_at'] = booking_dict['created_at'].isoformat()
     
     await db.bookings.insert_one(booking_dict)
-    
-    # Send confirmation email
-    await send_email(
-        current_user["email"],
-        "Booking Confirmation",
-        f"""Hi {current_user['name']},
-        
-Your booking has been confirmed!
-
-Property: {prop['name']}
-Check-in: {check_in.strftime('%Y-%m-%d')}
-Check-out: {check_out.strftime('%Y-%m-%d')}
-Total Price: ${total_price}
-
-Thank you for booking with us!"""
-    )
     
     return booking
 
@@ -445,14 +607,8 @@ async def cancel_booking(
     await send_email(
         current_user["email"],
         "Booking Cancelled",
-        f"""Hi {current_user['name']},
-        
-Your booking has been cancelled.
-
-Booking ID: {booking_id}
-Property: {booking['property_name']}
-
-If you have any questions, please contact us."""
+        get_cancellation_email_html(current_user['name'], booking['property_name'], booking_id),
+        is_html=True
     )
     
     return {"message": "Booking cancelled successfully"}
@@ -471,6 +627,224 @@ async def check_availability(property_id: str, check_in: str, check_out: str):
     })
     
     return {"available": overlapping is None}
+
+# ============= STRIPE PAYMENT ROUTES =============
+
+@api_router.post("/payment/checkout/session")
+async def create_stripe_checkout_session(
+    request_data: StripeCheckoutRequest,
+    current_user: dict = Depends(get_current_user),
+    request: Request = None
+):
+    # Get booking
+    booking = await db.bookings.find_one({"id": request_data.booking_id}, {"_id": 0})
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    if booking["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    if booking["payment_status"] == "paid":
+        raise HTTPException(status_code=400, detail="Booking already paid")
+    
+    # Initialize Stripe checkout
+    origin_url = request_data.origin_url
+    webhook_url = f"{origin_url}/api/webhook/stripe"
+    # MOCK STRIPE IMPLEMENTATION
+    # stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+    
+    # Create checkout session
+    success_url = f"{origin_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
+    # cancel_url = f"{origin_url}/property/{booking['property_id']}"
+    
+    # Mock session
+    mock_session_id = f"sess_mock_{uuid.uuid4()}"
+    mock_url = success_url.replace("{CHECKOUT_SESSION_ID}", mock_session_id)
+    
+    class MockSession:
+        def __init__(self, session_id, url):
+            self.session_id = session_id
+            self.url = url
+            
+    session = MockSession(mock_session_id, mock_url)
+    
+    # checkout_request = CheckoutSessionRequest(...)
+    # session: CheckoutSessionResponse = await stripe_checkout.create_checkout_session(checkout_request)
+    
+    # Create payment transaction record
+    transaction = PaymentTransaction(
+        booking_id=request_data.booking_id,
+        user_id=current_user["id"],
+        session_id=session.session_id,
+        amount=float(booking["total_price"]),
+        currency="usd",
+        payment_status="pending",
+        metadata={
+            "booking_id": request_data.booking_id,
+            "user_id": current_user["id"],
+            "property_id": booking["property_id"]
+        }
+    )
+    
+    transaction_dict = transaction.model_dump()
+    transaction_dict['created_at'] = transaction_dict['created_at'].isoformat()
+    transaction_dict['updated_at'] = transaction_dict['updated_at'].isoformat()
+    
+    await db.payment_transactions.insert_one(transaction_dict)
+    
+    # Update booking with session ID
+    await db.bookings.update_one(
+        {"id": request_data.booking_id},
+        {"$set": {"stripe_session_id": session.session_id}}
+    )
+    
+    return {"url": session.url, "session_id": session.session_id}
+
+@api_router.get("/payment/checkout/status/{session_id}")
+async def get_checkout_status(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    # Get payment transaction
+    transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Payment transaction not found")
+    
+    if transaction["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # If already processed, return cached status
+    if transaction["payment_status"] in ["paid", "failed", "expired"]:
+        return {
+            "status": transaction["payment_status"],
+            "payment_status": transaction["payment_status"],
+            "amount_total": int(transaction["amount"] * 100),
+            "currency": transaction["currency"],
+            "metadata": transaction["metadata"]
+        }
+    
+    # Initialize Stripe checkout
+    # Initialize Stripe checkout
+    # stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url="")
+    
+    # Get status from Stripe
+    try:
+        # checkout_status: CheckoutStatusResponse = await stripe_checkout.get_checkout_status(session_id)
+        
+        class MockStatus:
+            payment_status = "paid"
+            
+        checkout_status = MockStatus()
+        
+        # Update transaction status
+        await db.payment_transactions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "payment_status": checkout_status.payment_status,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        
+        # If payment is successful and not already confirmed, update booking
+        if checkout_status.payment_status == "paid":
+            booking_id = transaction["metadata"]["booking_id"]
+            booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
+            
+            if booking and booking["status"] != "confirmed":
+                # Update booking status
+                await db.bookings.update_one(
+                    {"id": booking_id},
+                    {"$set": {
+                        "status": "confirmed",
+                        "payment_status": "paid"
+                    }}
+                )
+                
+                # Send confirmation email
+                user = await db.users.find_one({"id": transaction["user_id"]}, {"_id": 0})
+                if user:
+                    check_in = datetime.fromisoformat(booking['check_in'])
+                    check_out = datetime.fromisoformat(booking['check_out'])
+                    
+                    await send_email(
+                        user["email"],
+                        "Booking Confirmed - Payment Successful",
+                        get_booking_confirmation_html(
+                            user['name'], 
+                            booking['property_name'], 
+                            check_in.strftime('%Y-%m-%d'), 
+                            check_out.strftime('%Y-%m-%d'), 
+                            booking['total_price']
+                        ),
+                        is_html=True
+                    )
+        
+        return {
+            "status": checkout_status.status,
+            "payment_status": checkout_status.payment_status,
+            "amount_total": checkout_status.amount_total,
+            "currency": checkout_status.currency,
+            "metadata": checkout_status.metadata
+        }
+    except Exception as e:
+        logger.error(f"Error checking payment status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to check payment status: {str(e)}")
+
+@api_router.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhooks"""
+    try:
+        body = await request.body()
+        signature = request.headers.get("Stripe-Signature")
+        
+        stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url="")
+        webhook_response = await stripe_checkout.handle_webhook(body, signature)
+        
+        # Update payment transaction and booking based on webhook event
+        if webhook_response.event_type in ["checkout.session.completed", "payment_intent.succeeded"]:
+            session_id = webhook_response.session_id
+            
+            transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+            if transaction and transaction["payment_status"] != "paid":
+                # Update transaction
+                await db.payment_transactions.update_one(
+                    {"session_id": session_id},
+                    {"$set": {
+                        "payment_status": webhook_response.payment_status,
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    }}
+                )
+                
+                # Update booking
+                booking_id = transaction["metadata"]["booking_id"]
+                await db.bookings.update_one(
+                    {"id": booking_id},
+                    {"$set": {
+                        "status": "confirmed",
+                        "payment_status": "paid"
+                    }}
+                )
+        
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ============= ADMIN TOOLS =============
+
+@api_router.get("/admin/test-email")
+async def test_email_endpoint(current_user: dict = Depends(get_admin_user)):
+    """Test SMTP configuration"""
+    try:
+        await send_email(
+            current_user["email"],
+            "SMTP Configuration Test",
+            f"<h1>Test Successful!</h1><p>Hi {current_user['name']}, your SMTP settings are working correctly.</p>",
+            is_html=True
+        )
+        return {"message": "Test email sent successfully to your email address"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send test email: {str(e)}")
 
 # ============= REVIEW ROUTES =============
 
@@ -532,24 +906,15 @@ async def get_property_reviews(property_id: str):
     
     return reviews
 
-# ============= PAYMENT ROUTES =============
-
-@api_router.post("/payment/mock")
-async def process_mock_payment(payment: PaymentMock):
-    """Mock payment processing - always succeeds"""
-    logger.info(f"Mock payment processed: Booking {payment.booking_id}, Amount ${payment.amount}")
-    
-    return {
-        "success": True,
-        "transaction_id": str(uuid.uuid4()),
-        "message": "Payment processed successfully (MOCK)"
-    }
-
 # ============= HEALTH CHECK =============
 
 @api_router.get("/")
 async def root():
-    return {"message": "Hotel Booking System API", "version": "1.0.0"}
+    return {
+        "message": "Hotel Booking System API - Enhanced",
+        "version": "2.0.0",
+        "features": ["Stripe Payments", "Real Email", "Advanced Search"]
+    }
 
 # Include the router in the main app
 app.include_router(api_router)

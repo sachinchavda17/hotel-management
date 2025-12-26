@@ -12,6 +12,7 @@ import HomePage from './pages/HomePage';
 import PropertyDetailsPage from './pages/PropertyDetailsPage';
 import UserDashboard from './pages/UserDashboard';
 import AdminDashboard from './pages/AdminDashboard';
+import PaymentSuccessPage from './pages/PaymentSuccessPage';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -105,6 +106,7 @@ function App() {
             <Route path="/login" element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
             <Route path="/property/:id" element={<PropertyDetailsPage />} />
+            <Route path="/payment/success" element={<PaymentSuccessPage />} />
             <Route
               path="/dashboard"
               element={
