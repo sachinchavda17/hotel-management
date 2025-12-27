@@ -18,6 +18,8 @@ node_modules/
 
 # Testing
 /coverage
+/old_backend
+/new_backend
 
 # Next.js
 /.next/
