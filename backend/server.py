@@ -49,6 +49,10 @@ security = HTTPBearer()
 # Create the main app
 app = FastAPI()
 
+@app.get("/")
+def root():
+    return {"status": "OK", "message": "Hotel Management Backend is running"}
+
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
