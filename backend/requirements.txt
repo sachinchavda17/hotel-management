@@ -26,16 +26,24 @@ filelock==3.20.1
 flake8==7.3.0
 frozenlist==1.8.0
 fsspec==2025.12.0
-google-api-core==2.19.2
-googleapis-common-protos==1.72.0
+
+# ✅ Google stack (LOCKED & COMPATIBLE)
+google-ai-generativelanguage==0.6.15
+google-api-core==1.34.1
+google-api-python-client==2.187.0
 google-auth==2.45.0
 google-auth-httplib2==0.3.0
-google-api-python-client==2.187.0
+googleapis-common-protos==1.72.0
+proto-plus==1.27.0
+protobuf==5.29.5
+
+# ✅ gRPC stack
 grpcio==1.75.1
 grpcio-status==1.75.1
+
 google-genai==1.56.0
 google-generativeai==0.8.6
-google-ai-generativelanguage==0.6.15
+
 h11==0.16.0
 hf-xet==1.2.0
 httpcore==1.0.9
@@ -66,15 +74,12 @@ mypy_extensions==1.1.0
 oauthlib==3.3.1
 openai==1.99.9
 packaging==25.0
-
 passlib==1.7.4
 pathspec==0.12.1
 pillow==12.0.0
 platformdirs==4.5.1
 pluggy==1.6.0
 propcache==0.4.1
-proto-plus==1.27.0
-protobuf==5.29.5
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
 pycodestyle==2.14.0
